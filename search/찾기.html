@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YouTube 다중 채널 키워드 검색</title>
+<style>
+  body { font-family: "Apple SD Gothic Neo", "맑은 고딕", sans-serif;
+         max-width: 860px; margin: 20px auto; padding: 0 14px; color:#eee;
+         background:#1a1a1a; }
+  h1 { font-size: 1.2em; }
+  label { display:block; margin-top:10px; font-weight:bold; font-size:0.95em; }
+  input[type=text] {
+    width:100%; padding:10px; font-size:1em; box-sizing:border-box;
+    font-family:inherit; background:#2a2a2a; color:#eee; border:1px solid #444;
+    border-radius:4px;
+  }
+  button { margin-top:10px; padding:10px 18px; font-size:0.95em; cursor:pointer;
+           background:#c00; color:white; border:none; border-radius:4px; }
+  button.sub { background:#446; }
+  button:hover { opacity:0.85; }
+  .filebox { background:#222; padding:12px 14px; border-radius:6px; margin-top:12px; }
+  .filebox .file-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+                       margin-top:6px; }
+  .filebox label.fileLbl {
+    display:inline-block; padding:6px 12px; background:#446; color:#fff;
+    border-radius:4px; cursor:pointer; font-weight:normal; margin:0;
+  }
+  .filebox input[type=file] { display:none; }
+  .status { font-size:0.85em; }
+  .ok  { color:#6c6; }
+  .err { color:#ff6060; }
+  .hint { color:#999; font-size:0.82em; margin-top:4px; }
+  #results { margin-top:20px; font-family: Consolas, monospace; line-height:1.7;
+             font-size:0.92em; }
+  .row { padding:6px 0; border-bottom:1px dashed #444; }
+  .row a { color:#ff7070; text-decoration:none; }
+  details { margin-top:12px; }
+  summary { cursor:pointer; color:#7af; font-weight:bold; }
+  pre.preview { background:#111; padding:8px; border-radius:4px; font-size:0.8em;
+                color:#aaa; max-height:120px; overflow:auto; margin:6px 0 0; }
+</style>
+</head>
+<body>
+  <h1>📺 YouTube 다중 채널 키워드 검색</h1>
+
+  <details id="settings">
+    <summary>⚙️ 설정 파일 불러오기 / 초기화</summary>
+
+    <div class="filebox">
+      <div><b>secret.txt</b> <span id="secStatus" class="status">— 미로드</span></div>
+      <div class="file-row">
+        <label class="fileLbl">파일 선택
+          <input type="file" id="secretFile" accept=".txt,text/plain">
+        </label>
+        <span class="hint">파일 안에 API 키 한 줄만 (AIzaSy...)</span>
+      </div>
+      <pre class="preview" id="secPreview" style="display:none;"></pre>
+    </div>
+
+    <div class="filebox">
+      <div><b>channels.txt</b> <span id="chStatus" class="status">— 미로드</span></div>
+      <div class="file-row">
+        <label class="fileLbl">파일 선택
+          <input type="file" id="channelFile" accept=".txt,text/plain">
+        </label>
+        <span class="hint">한 줄에 채널 하나 (@핸들)</span>
+      </div>
+      <pre class="preview" id="chPreview" style="display:none;"></pre>
+    </div>
+
+    <button class="sub" onclick="clearStorage()">저장된 설정 삭제</button>
+  </details>
+
+  <label>키워드</label>
+  <input type="text" id="keyword" placeholder="예: 장동혁" />
+
+  <button onclick="doSearch()">검색</button>
+
+  <div id="results"></div>
+
+<script>
+const API = "https://www.googleapis.com/youtube/v3";
+let API_KEY  = "";
+let CHANNELS = [];
+
+const $ = id => document.getElementById(id);
+
+function readFile(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload  = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsText(file, "UTF-8");
+  });
+}
+
+// ─── secret.txt: 100% 값만 (한 줄) ───
+$("secretFile").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    const txt = await readFile(f);
+    const key = txt.split(/\r?\n/).map(s=>s.trim()).filter(Boolean)[0] || "";
+    if (!key) throw new Error("파일이 비어있습니다.");
+    if (key.length < 20) throw new Error("키 형식이 올바르지 않습니다.");
+    API_KEY = key;
+    localStorage.setItem("yt_api_key", API_KEY);
+    $("secStatus").innerHTML = '<span class="ok">✓ 로드 완료</span>';
+    $("secPreview").style.display = "block";
+    $("secPreview").textContent = "API Key: " + API_KEY.slice(0,8) + "..." + API_KEY.slice(-4);
+  } catch (err) {
+    $("secStatus").innerHTML = '<span class="err">✗ ' + err.message + '</span>';
+  }
+});
+
+// ─── channels.txt ───
+$("channelFile").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    const txt = await readFile(f);
+    CHANNELS = txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    if (!CHANNELS.length) throw new Error("채널 목록이 비어있습니다.");
+    localStorage.setItem("yt_channels", JSON.stringify(CHANNELS));
+    $("chStatus").innerHTML = '<span class="ok">✓ ' + CHANNELS.length + '개 채널 로드</span>';
+    $("chPreview").style.display = "block";
+    $("chPreview").textContent = CHANNELS.join("\n");
+  } catch (err) {
+    $("chStatus").innerHTML = '<span class="err">✗ ' + err.message + '</span>';
+  }
+});
+
+// ─── localStorage 복원 ───
+function restore() {
+  const k = localStorage.getItem("yt_api_key");
+  const c = localStorage.getItem("yt_channels");
+  if (k) {
+    API_KEY = k;
+    $("secStatus").innerHTML = '<span class="ok">✓ 저장된 키 사용중</span>';
+    $("secPreview").style.display = "block";
+    $("secPreview").textContent = "API Key: " + k.slice(0,8) + "..." + k.slice(-4);
+  }
+  if (c) {
+    try {
+      CHANNELS = JSON.parse(c);
+      $("chStatus").innerHTML = '<span class="ok">✓ 저장된 ' + CHANNELS.length + '개 채널 사용중</span>';
+      $("chPreview").style.display = "block";
+      $("chPreview").textContent = CHANNELS.join("\n");
+    } catch {}
+  }
+  if (!k || !c) $("settings").open = true;
+}
+
+function clearStorage() {
+  if (!confirm("저장된 API 키와 채널 목록을 삭제할까요?")) return;
+  localStorage.removeItem("yt_api_key");
+  localStorage.removeItem("yt_channels");
+  API_KEY = ""; CHANNELS = [];
+  $("secStatus").innerHTML = "— 미로드";
+  $("chStatus").innerHTML = "— 미로드";
+  $("secPreview").style.display = "none";
+  $("chPreview").style.display = "none";
+}
+
+// ─── YouTube API ───
+async function resolveChannelId(handleOrId) {
+  if (/^UC[A-Za-z0-9_-]{22}$/.test(handleOrId)) return handleOrId;
+  const handle = handleOrId.replace(/^@/, "");
+  const url = `${API}/channels?part=id&forHandle=@${encodeURIComponent(handle)}&key=${API_KEY}`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  return j.items?.[0]?.id || null;
+}
+
+async function searchChannel(channelId, keyword, maxResults = 5) {
+  const url = `${API}/search?part=snippet&channelId=${channelId}`
+            + `&q=${encodeURIComponent(keyword)}&type=video`
+            + `&maxResults=${maxResults}&order=date&key=${API_KEY}`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  return j.items || [];
+}
+
+function decode(s) {
+  return s.replace(/&amp;/g,"&").replace(/&quot;/g,'"')
+          .replace(/&#39;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">");
+}
+
+async function doSearch() {
+  const keyword = $("keyword").value.trim();
+  const out = $("results");
+
+  if (!API_KEY)        { out.innerHTML = '<p class="err">secret.txt를 먼저 불러오세요.</p>'; $("settings").open=true; return; }
+  if (!CHANNELS.length){ out.innerHTML = '<p class="err">channels.txt를 먼저 불러오세요.</p>'; $("settings").open=true; return; }
+  if (!keyword)        { out.innerHTML = '<p class="err">키워드를 입력하세요.</p>'; return; }
+
+  out.innerHTML = "<p>검색 중…</p>";
+  const rows = [];
+  let idx = 1;
+
+  for (const ch of CHANNELS) {
+    try {
+      const id = await resolveChannelId(ch);
+      if (!id) { rows.push(`<div class="row err">${ch} → 채널을 찾을 수 없음</div>`); continue; }
+      const vids = await searchChannel(id, keyword);
+      if (!vids.length) { rows.push(`<div class="row">${ch} → 검색 결과 없음</div>`); continue; }
+      for (const v of vids) {
+        const title = decode(v.snippet.title);
+        const vid = v.id.videoId;
+        const date = v.snippet.publishedAt.slice(0,10);
+        rows.push(
+          `<div class="row">#${idx} ${ch}, `
+          + `<a href="https://www.youtube.com/watch?v=${vid}" target="_blank">${title}</a>, `
+          + `${keyword} <span class="hint">(${date})</span></div>`
+        );
+        idx++;
+      }
+    } catch (e) {
+      rows.push(`<div class="row err">${ch} → 오류: ${e.message}</div>`);
+    }
+  }
+  out.innerHTML = rows.join("") || "<p>결과 없음</p>";
+}
+
+$("keyword").addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+
+restore();
+</script>
+</body>
+</html>

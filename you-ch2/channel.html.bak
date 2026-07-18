@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>채널 일괄 자막 다운로드</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666;
+    --border: #d0d0d0;
+    --primary: #c4302b;
+    --primary-fg: #ffffff;
+    --card: #f7f7f7;
+    --error: #c0392b;
+    --success: #27ae60;
+    --warn: #d97706;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a1a;
+      --fg: #e8e8e8;
+      --muted: #999;
+      --border: #444;
+      --primary: #e74c3c;
+      --card: #2a2a2a;
+      --error: #ff6b6b;
+      --success: #4ade80;
+      --warn: #fbbf24;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif;
+    font-size: 16px; line-height: 1.5;
+    background: var(--bg); color: var(--fg);
+  }
+  h1 { font-size: 20px; margin: 0 0 8px 0; }
+  .back-link {
+    display: inline-block; margin-bottom: 16px;
+    font-size: 14px; color: var(--muted); text-decoration: none;
+  }
+  .back-link:hover { color: var(--primary); }
+
+  .section {
+    margin-bottom: 16px; padding: 12px;
+    background: var(--card); border-radius: 6px;
+  }
+  .section h2 {
+    font-size: 15px; margin: 0 0 8px 0;
+    color: var(--fg);
+  }
+  label {
+    display: block; font-size: 13px;
+    color: var(--muted); margin-bottom: 4px;
+  }
+  textarea, input[type="text"], input[type="number"], input[type="date"] {
+    width: 100%; padding: 8px 10px;
+    font-size: 14px; border: 1px solid var(--border);
+    border-radius: 4px; background: var(--bg); color: var(--fg);
+    font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 80px; }
+
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+
+  .checkbox-row {
+    display: flex; align-items: center; gap: 6px;
+    margin-top: 6px; font-size: 14px;
+  }
+  .checkbox-row input { width: auto; }
+
+  .mode-row {
+    display: flex; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 10px; font-size: 14px;
+  }
+  .mode-row label {
+    display: inline-flex; align-items: center; gap: 4px;
+    color: var(--fg); margin: 0; cursor: pointer;
+  }
+  .mode-row input { width: auto; }
+
+  .saved-channels {
+    max-height: 140px; overflow-y: auto;
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 8px; background: var(--bg);
+  }
+  .saved-channels.empty {
+    color: var(--muted); font-size: 13px;
+    text-align: center; padding: 12px;
+  }
+  .saved-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 3px 0; font-size: 13px;
+  }
+  .saved-item input { width: auto; }
+  .saved-item label {
+    margin: 0; color: var(--fg); cursor: pointer;
+    font-size: 13px; flex: 1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .saved-item .handle { color: var(--muted); margin-left: 4px; }
+
+  button {
+    padding: 10px 16px; font-size: 14px;
+    border: none; border-radius: 6px;
+    cursor: pointer; font-family: inherit;
+  }
+  button.primary {
+    background: var(--primary); color: var(--primary-fg);
+    font-weight: 600;
+  }
+  button.secondary {
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border);
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .progress-wrap { display: none; }
+  .progress-wrap.visible { display: block; }
+  .progress-bar {
+    width: 100%; height: 8px; background: var(--border);
+    border-radius: 4px; overflow: hidden; margin: 8px 0;
+  }
+  .progress-fill {
+    height: 100%; background: var(--primary);
+    width: 0%; transition: width 0.3s;
+  }
+  .current-info {
+    font-size: 13px; color: var(--muted);
+    margin-bottom: 4px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .current-info strong { color: var(--fg); }
+
+  .log {
+    margin-top: 8px; padding: 8px;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px;
+    max-height: 240px; overflow-y: auto;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 12px; line-height: 1.5;
+  }
+  .log-line { padding: 1px 0; }
+  .log-line.warn { color: var(--warn); }
+  .log-line.error { color: var(--error); }
+
+  .result-box {
+    display: none; margin-top: 12px; padding: 12px;
+    background: var(--card); border-radius: 6px;
+  }
+  .result-box.visible { display: block; }
+  .result-box .success-msg {
+    color: var(--success); font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .result-box .fail-msg {
+    color: var(--error); font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .cache-row {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--muted);
+  }
+  .cache-row button {
+    padding: 4px 10px; font-size: 12px;
+  }
+
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .toast {
+    position: fixed; bottom: 24px; left: 50%;
+    transform: translateX(-50%);
+    padding: 10px 20px;
+    background: rgba(0,0,0,0.85); color: #fff;
+    border-radius: 20px; font-size: 14px;
+    opacity: 0; transition: opacity 0.2s;
+    pointer-events: none; z-index: 1000;
+  }
+  .toast.visible { opacity: 1; }
+</style>
+</head>
+<body>
+
+<a href="/" class="back-link">← 단건 다운로드로</a>
+<h1>채널 일괄 자막 다운로드</h1>
+
+<!-- 채널 입력 -->
+<div class="section">
+  <h2>채널 입력</h2>
+  <label>@채널ID 형식, 줄바꿈으로 구분</label>
+  <textarea id="channels" placeholder="@channel1&#10;@channel2"></textarea>
+  <div class="hint">URL 전체 붙여넣어도 자동으로 @핸들만 추출됩니다.</div>
+</div>
+
+<!-- 저장된 채널 -->
+<div class="section">
+  <h2>저장된 채널 <span id="savedCount" style="color:var(--muted);font-weight:normal;font-size:13px;"></span></h2>
+  <div id="savedChannels" class="saved-channels empty">불러오는 중...</div>
+  <div class="actions" style="margin-top: 8px;">
+    <button id="addSelected" class="secondary" type="button">선택한 채널 추가</button>
+    <button id="refreshSaved" class="secondary" type="button">새로고침</button>
+  </div>
+</div>
+
+<!-- 필터 옵션 -->
+<div class="section">
+  <h2>필터 옵션</h2>
+
+  <label>다운로드 대상</label>
+  <div class="mode-row">
+    <label><input type="radio" name="mode" value="all" checked> 전체</label>
+    <label><input type="radio" name="mode" value="videos"> 일반 영상만</label>
+    <label><input type="radio" name="mode" value="streams"> 라이브만</label>
+  </div>
+
+  <label>최근 N개 영상</label>
+  <input id="maxCount" type="number" min="1" max="500" value="50">
+
+  <label style="margin-top:10px;">업로드 기간 (선택)</label>
+  <div class="row">
+    <input id="dateStart" type="date" placeholder="시작">
+    <input id="dateEnd" type="date" placeholder="끝">
+  </div>
+
+  <label style="margin-top:10px;">길이 (분, 선택, 라이브는 면제)</label>
+  <div class="row">
+    <input id="minMinutes" type="number" min="0" step="0.5" value="1" placeholder="최소">
+    <input id="maxMinutes" type="number" min="0" step="0.5" placeholder="최대">
+  </div>
+
+  <div class="checkbox-row">
+    <input id="excludeShorts" type="checkbox" checked>
+    <label for="excludeShorts" style="margin:0;color:var(--fg);">쇼츠 제외</label>
+  </div>
+  <div class="checkbox-row">
+    <input id="useCache" type="checkbox" checked>
+    <label for="useCache" style="margin:0;color:var(--fg);">이미 받은 영상 스킵</label>
+  </div>
+</div>
+
+<!-- 캐시 관리 -->
+<div class="section">
+  <h2>다운로드 캐시</h2>
+  <div class="cache-row">
+    <span id="cacheStatus">확인 중...</span>
+    <button id="clearCache" class="secondary" type="button">캐시 초기화</button>
+  </div>
+</div>
+
+<!-- 실행 -->
+<div class="actions" style="margin-bottom: 16px;">
+  <button id="run" class="primary" type="button" style="flex:1;">실행</button>
+  <button id="stop" class="secondary" type="button" disabled>중단</button>
+</div>
+
+<!-- 진행 -->
+<div id="progressWrap" class="progress-wrap section">
+  <h2 id="phaseTitle">진행 상황</h2>
+  <div id="currentInfo" class="current-info"></div>
+  <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+  <div id="progressText" style="font-size:13px;color:var(--muted);"></div>
+  <div id="log" class="log"></div>
+</div>
+
+<!-- 결과 -->
+<div id="resultBox" class="result-box">
+  <div id="resultMsg"></div>
+  <button id="downloadZip" class="primary" type="button" style="margin-top:8px;">ZIP 다운로드</button>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const $channels = $('channels');
+  const $savedChannels = $('savedChannels');
+  const $savedCount = $('savedCount');
+  const $addSelected = $('addSelected');
+  const $refreshSaved = $('refreshSaved');
+  const $maxCount = $('maxCount');
+  const $dateStart = $('dateStart');
+  const $dateEnd = $('dateEnd');
+  const $minMinutes = $('minMinutes');
+  const $maxMinutes = $('maxMinutes');
+  const $excludeShorts = $('excludeShorts');
+  const $useCache = $('useCache');
+  const $cacheStatus = $('cacheStatus');
+  const $clearCache = $('clearCache');
+  const $run = $('run');
+  const $stop = $('stop');
+  const $progressWrap = $('progressWrap');
+  const $phaseTitle = $('phaseTitle');
+  const $currentInfo = $('currentInfo');
+  const $progressFill = $('progressFill');
+  const $progressText = $('progressText');
+  const $log = $('log');
+  const $resultBox = $('resultBox');
+  const $resultMsg = $('resultMsg');
+  const $downloadZip = $('downloadZip');
+  const $toast = $('toast');
+
+  let currentEventSource = null;
+  let currentJobId = null;
+  let currentDownloadUrl = null;
+
+  // ============================================================
+  // 저장된 채널 로드
+  // ============================================================
+  async function loadSavedChannels() {
+    try {
+      const resp = await fetch('/api/channel/saved');
+      const data = await resp.json();
+      if (!data.ok) return;
+      renderSavedChannels(data.channels || []);
+    } catch (e) {
+      $savedChannels.className = 'saved-channels empty';
+      $savedChannels.textContent = '불러오기 실패';
+    }
+  }
+
+  function renderSavedChannels(channels) {
+    if (!channels.length) {
+      $savedChannels.className = 'saved-channels empty';
+      $savedChannels.textContent = '저장된 채널이 없습니다. 실행하면 자동 저장됩니다.';
+      $savedCount.textContent = '';
+      return;
+    }
+    $savedChannels.className = 'saved-channels';
+    $savedCount.textContent = `(${channels.length})`;
+    $savedChannels.innerHTML = channels.map((c, i) => `
+      <div class="saved-item">
+        <input type="checkbox" id="sc${i}" value="${escapeAttr(c.handle)}">
+        <label for="sc${i}" title="${escapeAttr(c.title)}">
+          ${escapeHtml(c.title)}<span class="handle">${escapeHtml(c.handle)}</span>
+        </label>
+      </div>
+    `).join('');
+  }
+
+  $addSelected.addEventListener('click', () => {
+    const checked = $savedChannels.querySelectorAll('input[type="checkbox"]:checked');
+    if (!checked.length) {
+      showToast('선택된 채널이 없습니다');
+      return;
+    }
+    const existing = $channels.value
+      .split('\n').map(s => s.trim()).filter(Boolean);
+    const set = new Set(existing);
+    checked.forEach(cb => set.add(cb.value));
+    $channels.value = Array.from(set).join('\n');
+    checked.forEach(cb => cb.checked = false);
+    showToast(`${checked.length}개 채널 추가됨`);
+  });
+
+  $refreshSaved.addEventListener('click', loadSavedChannels);
+
+  // ============================================================
+  // 캐시 상태
+  // ============================================================
+  async function loadCacheStatus() {
+    try {
+      const resp = await fetch('/api/channel/cache');
+      const data = await resp.json();
+      if (data.ok) {
+        $cacheStatus.textContent = `받은 영상 ${data.count}개 기록됨`;
+      }
+    } catch (e) {
+      $cacheStatus.textContent = '확인 실패';
+    }
+  }
+
+  $clearCache.addEventListener('click', async () => {
+    if (!confirm('캐시를 초기화하면 이전에 받은 영상도 다시 받게 됩니다. 진행할까요?')) return;
+    try {
+      const resp = await fetch('/api/channel/cache/clear', { method: 'POST' });
+      const data = await resp.json();
+      if (data.ok) {
+        showToast('캐시가 초기화되었습니다');
+        loadCacheStatus();
+      } else {
+        showToast('실패: ' + (data.error || ''));
+      }
+    } catch (e) {
+      showToast('실패: ' + e.message);
+    }
+  });
+
+  // ============================================================
+  // 실행
+  // ============================================================
+  $run.addEventListener('click', startJob);
+
+  async function startJob() {
+    const channelsText = $channels.value.trim();
+    if (!channelsText) {
+      showToast('채널을 입력해주세요');
+      return;
+    }
+
+    if (currentEventSource) {
+      currentEventSource.close();
+      currentEventSource = null;
+    }
+
+    $log.innerHTML = '';
+    $currentInfo.textContent = '';
+    $progressFill.style.width = '0%';
+    $progressText.textContent = '';
+    $phaseTitle.textContent = '작업 시작 중...';
+    $progressWrap.classList.add('visible');
+    $resultBox.classList.remove('visible');
+    $downloadZip.style.display = '';
+    $run.disabled = true;
+    $stop.disabled = false;
+    currentDownloadUrl = null;
+
+    const modeEl = document.querySelector('input[name="mode"]:checked');
+    const mode = modeEl ? modeEl.value : 'all';
+
+    const params = {
+      channels: channelsText,
+      max_count: parseInt($maxCount.value) || 50,
+      date_start: $dateStart.value || null,
+      date_end: $dateEnd.value || null,
+      min_minutes: $minMinutes.value || null,
+      max_minutes: $maxMinutes.value || null,
+      exclude_shorts: $excludeShorts.checked,
+      use_cache: $useCache.checked,
+      mode: mode,
+    };
+
+    try {
+      const resp = await fetch('/api/channel/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      });
+      const data = await resp.json();
+      if (!data.ok) {
+        showFailure(data.error || '작업 시작 실패');
+        return;
+      }
+      currentJobId = data.job_id;
+      const modeLabel = { all: '전체', videos: '일반 영상만', streams: '라이브만' }[data.mode] || data.mode;
+      appendLog(`작업 시작: ${data.handles.length}개 채널 (모드: ${modeLabel})`, 'info');
+      openStream(data.job_id);
+    } catch (e) {
+      showFailure('서버 통신 실패: ' + e.message);
+    }
+  }
+
+  function openStream(jobId) {
+    const es = new EventSource(`/api/channel/stream/${jobId}`);
+    currentEventSource = es;
+
+    es.onmessage = (msg) => {
+      let ev;
+      try { ev = JSON.parse(msg.data); } catch (e) { return; }
+      handleEvent(ev);
+    };
+
+    es.onerror = () => {
+      es.close();
+      currentEventSource = null;
+      if (!currentDownloadUrl) {
+        appendLog('스트림 연결이 끊겼습니다.', 'warn');
+        $run.disabled = false;
+        $stop.disabled = true;
+      }
+    };
+  }
+
+  function handleEvent(ev) {
+    switch (ev.type) {
+      case 'connected':
+        appendLog('서버 연결됨', 'info');
+        break;
+      case 'phase':
+        $phaseTitle.textContent =
+          ev.phase === 'listing' ? '영상 목록 수집 중'
+          : ev.phase === 'downloading' ? `자막 다운로드 중 (전체 ${ev.total}개)`
+          : '진행 중';
+        if (ev.message) appendLog(ev.message, 'info');
+        break;
+      case 'progress':
+        $currentInfo.innerHTML =
+          `<strong>[${escapeHtml(ev.channel || '')}]</strong> ${escapeHtml(ev.title || '')}`;
+        const pct = ev.total > 0 ? (ev.current / ev.total) * 100 : 0;
+        $progressFill.style.width = pct + '%';
+        $progressText.textContent = `${ev.current} / ${ev.total}`;
+        break;
+      case 'log':
+        appendLog(ev.message, ev.level || 'info');
+        break;
+      case 'error':
+        appendLog(ev.message, 'error');
+        break;
+      case 'done':
+        if (ev.download_url) {
+          currentDownloadUrl = ev.download_url;
+          showSuccess(ev.result_filename);
+        } else {
+          showFailure('완료되었으나 결과 파일이 없습니다.');
+        }
+        $run.disabled = false;
+        $stop.disabled = true;
+        if (currentEventSource) {
+          currentEventSource.close();
+          currentEventSource = null;
+        }
+        loadSavedChannels();
+        loadCacheStatus();
+        break;
+    }
+  }
+
+  function appendLog(msg, level) {
+    const div = document.createElement('div');
+    div.className = 'log-line ' + (level || 'info');
+    div.textContent = msg;
+    $log.appendChild(div);
+    $log.scrollTop = $log.scrollHeight;
+  }
+
+  function showSuccess(filename) {
+    $resultMsg.innerHTML =
+      `<div class="success-msg">✓ 완료되었습니다</div>` +
+      `<div style="font-size:13px;color:var(--muted);">${escapeHtml(filename)}</div>`;
+    $resultBox.classList.add('visible');
+  }
+
+  function showFailure(msg) {
+    $resultMsg.innerHTML = `<div class="fail-msg">✕ ${escapeHtml(msg)}</div>`;
+    $resultBox.classList.add('visible');
+    $downloadZip.style.display = 'none';
+    $run.disabled = false;
+    $stop.disabled = true;
+  }
+
+  $downloadZip.addEventListener('click', () => {
+    if (!currentDownloadUrl) {
+      showToast('다운로드 URL이 없습니다');
+      return;
+    }
+    window.location.href = currentDownloadUrl;
+  });
+
+  // ============================================================
+  // 중단
+  // ============================================================
+  $stop.addEventListener('click', () => {
+    if (!confirm('진행 중인 작업의 화면 표시를 중단합니다. (서버 작업은 계속 진행됩니다)')) return;
+    if (currentEventSource) {
+      currentEventSource.close();
+      currentEventSource = null;
+    }
+    appendLog('화면 모니터링을 중단했습니다. (서버는 계속 진행)', 'warn');
+    $run.disabled = false;
+    $stop.disabled = true;
+  });
+
+  // ============================================================
+  // 유틸
+  // ============================================================
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
+
+  let toastTimer = null;
+  function showToast(msg) {
+    $toast.textContent = msg;
+    $toast.classList.add('visible');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => $toast.classList.remove('visible'), 1800);
+  }
+
+  // 초기 로드
+  loadSavedChannels();
+  loadCacheStatus();
+</script>
+</body>
+</html>

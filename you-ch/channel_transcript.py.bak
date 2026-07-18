@@ -1,0 +1,645 @@
+# channel_transcript.py
+"""채널 단위 자막 일괄 다운로드 처리."""
+import os
+import re
+import json
+import csv
+import io
+import time
+import zipfile
+import threading
+import uuid
+from datetime import datetime, date
+from typing import Optional
+
+import yt_dlp
+
+from transcript import (
+    fetch_transcript,
+    _build_session_with_cookies,
+)
+
+
+# ============================================================
+# 경로 / 상수
+# ============================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOWNLOAD_DIR = os.path.expanduser("~/storage/shared/Download/youtube_clips")
+CACHE_FILE = os.path.join(DOWNLOAD_DIR, ".transcript_cache.json")
+CHANNELS_FILE = os.path.join(DOWNLOAD_DIR, ".saved_channels.json")
+
+MAX_ZIP_SIZE = 100 * 1024 * 1024  # 100MB
+SHORTS_MAX_SEC = 60               # 60초 이하는 쇼츠로 간주
+REQUEST_SLEEP = 0.7               # 요청 사이 sleep
+RETRY_DELAYS = [2, 5, 10]         # 재시도 백오프 (초)
+CHANNEL_FAIL_THRESHOLD = 5        # 연속 실패 N회면 채널 중단
+
+
+# ============================================================
+# 캐시 / 저장된 채널 관리
+# ============================================================
+def _ensure_dir():
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def load_cache() -> set:
+    """이미 받은 영상 ID 집합 로드."""
+    _ensure_dir()
+    if not os.path.exists(CACHE_FILE):
+        return set()
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("video_ids", []))
+    except Exception:
+        return set()
+
+
+def save_cache(video_ids: set):
+    _ensure_dir()
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {"video_ids": sorted(video_ids)},
+                f, ensure_ascii=False, indent=2,
+            )
+    except Exception as e:
+        print(f"[channel] 캐시 저장 실패: {e}")
+
+
+def clear_cache():
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
+
+
+def load_saved_channels() -> list:
+    """저장된 채널 목록 (최근 사용순)."""
+    _ensure_dir()
+    if not os.path.exists(CHANNELS_FILE):
+        return []
+    try:
+        with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_channels(channels: list):
+    _ensure_dir()
+    try:
+        with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(channels, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[channel] 채널목록 저장 실패: {e}")
+
+
+def add_saved_channel(handle: str, title: str):
+    """채널을 최근 사용 목록 맨 앞에 추가 (중복 제거)."""
+    channels = load_saved_channels()
+    channels = [c for c in channels if c.get("handle") != handle]
+    channels.insert(0, {
+        "handle": handle,
+        "title": title or handle,
+        "last_used": datetime.now().isoformat(timespec="seconds"),
+    })
+    save_channels(channels[:50])  # 최대 50개 유지
+
+
+# ============================================================
+# 파일명 / 유틸
+# ============================================================
+def sanitize_for_channel_filename(title: str, max_words: int = 4,
+                                   max_chars: int = 30) -> str:
+    """채널 모드 파일명용 제목 정리.
+    1. 특수문자/따옴표/이모지 제거 → 공백
+    2. 공백 정리
+    3. 앞 N어절
+    4. 길이 상한
+    """
+    if not title:
+        return "untitled"
+    # 파일시스템 금지 문자 + 따옴표 + 일반 특수문자
+    cleaned = re.sub(r'[\\/:*?"<>|\'`!@#$%^&()\[\]{}=+;,~]', " ", title)
+    # 이모지/제어문자 제거 (한글/영문/숫자/공백/하이픈/언더스코어만 남김)
+    cleaned = re.sub(
+        r"[^\w\sㄱ-ㅎㅏ-ㅣ가-힣\-]",
+        " ",
+        cleaned,
+        flags=re.UNICODE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "untitled"
+    words = cleaned.split(" ")[:max_words]
+    result = " ".join(words)
+    if len(result) > max_chars:
+        result = result[:max_chars].rstrip()
+    return result or "untitled"
+
+
+def build_channel_filename(title: str, upload_date_str: str) -> str:
+    """파일명: '{제목 4어절} {YYYY-MM-DD}.txt'
+
+    upload_date_str: yt-dlp가 주는 'YYYYMMDD' 형식.
+    """
+    name = sanitize_for_channel_filename(title)
+    if upload_date_str and len(upload_date_str) == 8:
+        d = f"{upload_date_str[:4]}-{upload_date_str[4:6]}-{upload_date_str[6:8]}"
+    else:
+        d = "unknown-date"
+    return f"{name} {d}.txt"
+
+
+def sanitize_channel_folder(name: str) -> str:
+    """ZIP 내부 채널명 폴더용 정리."""
+    if not name:
+        return "channel"
+    cleaned = re.sub(r'[\\/:*?"<>|\n\r\t]', "_", name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > 50:
+        cleaned = cleaned[:50].rstrip()
+    return cleaned or "channel"
+
+
+def parse_channel_handle(line: str) -> Optional[str]:
+    """사용자 입력에서 @핸들 추출.
+    허용: '@handle', 'https://youtube.com/@handle', 'youtube.com/@handle/videos' 등.
+    """
+    if not line:
+        return None
+    s = line.strip()
+    if not s:
+        return None
+    m = re.search(r"@([A-Za-z0-9_.\-]+)", s)
+    if m:
+        return "@" + m.group(1)
+    return None
+
+
+# ============================================================
+# 채널 영상 목록 조회
+# ============================================================
+def fetch_channel_videos(handle: str, max_count: int) -> dict:
+    """채널의 최근 N개 영상 메타데이터 조회 (flat).
+
+    Returns:
+        {"channel_title": str, "videos": [ {id, title, ...}, ... ]}
+    """
+    channel_url = f"https://www.youtube.com/{handle}/videos"
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "playlistend": max_count,
+    }
+    # 쿠키 파일 적용 (yt-dlp 형식)
+    cookie_path = os.path.join(BASE_DIR, "cookies.txt")
+    if os.path.exists(cookie_path):
+        ydl_opts["cookiefile"] = cookie_path
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(channel_url, download=False)
+
+    channel_title = info.get("title") or info.get("uploader") or handle
+    entries = info.get("entries") or []
+
+    videos = []
+    for e in entries:
+        if not e:
+            continue
+        vid = e.get("id")
+        if not vid:
+            continue
+        videos.append({
+            "id": vid,
+            "title": e.get("title") or "",
+            "duration": e.get("duration"),       # 초, None 가능
+            "url": e.get("url") or f"https://www.youtube.com/watch?v={vid}",
+            "live_status": e.get("live_status"),  # is_upcoming/is_live/was_live/not_live
+            "upload_date": e.get("upload_date"),
+        })
+
+    return {"channel_title": channel_title, "videos": videos}
+
+
+def fetch_video_full_meta(video_id: str) -> dict:
+    """flat 모드에서 빠진 필드(upload_date 등)를 단건 조회로 보완."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    cookie_path = os.path.join(BASE_DIR, "cookies.txt")
+    if os.path.exists(cookie_path):
+        ydl_opts["cookiefile"] = cookie_path
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+# ============================================================
+# 필터링
+# ============================================================
+def is_live_video(video: dict) -> bool:
+    """라이브 관련 영상인지 (끝난/진행중/예정 모두 포함)."""
+    return video.get("live_status") in ("is_live", "was_live", "is_upcoming")
+
+
+def is_shorts(video: dict) -> bool:
+    """쇼츠 판정: URL이 /shorts/ 포함하거나 길이 60초 이하.
+    단, 라이브 관련 영상은 쇼츠가 될 수 없으므로 무조건 False."""
+    if is_live_video(video):
+        return False
+    url = video.get("url") or ""
+    if "/shorts/" in url:
+        return True
+    dur = video.get("duration")
+    if dur is not None and dur <= SHORTS_MAX_SEC:
+        return True
+    return False
+
+
+def is_excluded_live(video: dict) -> bool:
+    """예정/진행 중 라이브는 제외. 끝난 라이브는 포함."""
+    status = video.get("live_status")
+    return status in ("is_upcoming", "is_live")
+
+
+def in_date_range(upload_date_str: Optional[str],
+                  start: Optional[str],
+                  end: Optional[str]) -> bool:
+    """upload_date(YYYYMMDD) 가 [start, end] 범위인지.
+    start/end는 'YYYY-MM-DD' 또는 None."""
+    if not start and not end:
+        return True
+    if not upload_date_str or len(upload_date_str) != 8:
+        # 날짜 모르면 범위 필터 켜져있을 때만 제외
+        return False
+    try:
+        d = date(int(upload_date_str[:4]),
+                 int(upload_date_str[4:6]),
+                 int(upload_date_str[6:8]))
+    except ValueError:
+        return False
+    if start:
+        try:
+            sd = date.fromisoformat(start)
+            if d < sd:
+                return False
+        except ValueError:
+            pass
+    if end:
+        try:
+            ed = date.fromisoformat(end)
+            if d > ed:
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+def in_duration_range(duration_sec: Optional[int],
+                      min_sec: Optional[int],
+                      max_sec: Optional[int]) -> bool:
+    """길이 범위 체크. 길이를 모르면(None) 통과시킴."""
+    if duration_sec is None:
+        return True
+    if min_sec is not None and duration_sec < min_sec:
+        return False
+    if max_sec is not None and duration_sec > max_sec:
+        return False
+    return True
+# ============================================================
+# Job 관리 (SSE용 인메모리 상태)
+# ============================================================
+class JobState:
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        self.events: list = []          # [dict, ...]
+        self.lock = threading.Lock()
+        self.finished = False
+        self.result_path: Optional[str] = None
+        self.result_filename: Optional[str] = None
+        self.cond = threading.Condition(self.lock)
+
+    def push(self, event: dict):
+        with self.cond:
+            self.events.append(event)
+            self.cond.notify_all()
+
+    def mark_done(self, result_path: Optional[str], filename: Optional[str]):
+        with self.cond:
+            self.finished = True
+            self.result_path = result_path
+            self.result_filename = filename
+            self.cond.notify_all()
+
+
+_JOBS: dict = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def create_job() -> JobState:
+    job_id = uuid.uuid4().hex
+    job = JobState(job_id)
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+    return job
+
+
+def get_job(job_id: str) -> Optional[JobState]:
+    with _JOBS_LOCK:
+        return _JOBS.get(job_id)
+
+
+def cleanup_job(job_id: str):
+    with _JOBS_LOCK:
+        _JOBS.pop(job_id, None)
+
+
+# ============================================================
+# 메인 처리 (백그라운드 스레드에서 실행)
+# ============================================================
+def run_channel_job(job: JobState, params: dict):
+    """params:
+        handles: [str, ...]   # ['@abc', '@def']
+        max_count: int
+        date_start: Optional[str]  # 'YYYY-MM-DD'
+        date_end: Optional[str]
+        min_minutes: Optional[float]
+        max_minutes: Optional[float]
+        exclude_shorts: bool
+        use_cache: bool
+    """
+    try:
+        _run_channel_job_inner(job, params)
+    except Exception as e:
+        job.push({"type": "error", "message": f"치명적 오류: {e}"})
+        job.mark_done(None, None)
+
+
+def _log(job: JobState, msg: str, level: str = "info"):
+    job.push({"type": "log", "level": level, "message": msg})
+
+
+def _run_channel_job_inner(job: JobState, params: dict):
+    handles = params["handles"]
+    max_count = params["max_count"]
+    date_start = params.get("date_start") or None
+    date_end = params.get("date_end") or None
+    min_minutes = params.get("min_minutes")
+    max_minutes = params.get("max_minutes")
+    exclude_shorts = bool(params.get("exclude_shorts", True))
+    use_cache = bool(params.get("use_cache", True))
+
+    min_sec = int(min_minutes * 60) if min_minutes else None
+    max_sec = int(max_minutes * 60) if max_minutes else None
+
+    cache = load_cache() if use_cache else set()
+
+    # 세션 한 번만 만들어서 재사용
+    session = _build_session_with_cookies(verbose=False)
+
+    _ensure_dir()
+    zip_filename = f"youtube_transcripts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    zip_path = os.path.join(DOWNLOAD_DIR, zip_filename)
+
+    # 메타데이터 누적
+    index_rows = []
+    failed_rows = []
+
+    # 1) 채널마다 영상 목록 수집
+    job.push({"type": "phase", "phase": "listing",
+              "message": "채널 영상 목록 수집 중..."})
+
+    channel_data = []  # [(handle, channel_title, filtered_videos)]
+    for handle in handles:
+        try:
+            _log(job, f"[{handle}] 영상 목록 조회 중")
+            info = fetch_channel_videos(handle, max_count)
+            channel_title = info["channel_title"]
+            videos = info["videos"]
+            _log(job, f"[{handle}] 가져온 영상: {len(videos)}개 (최근 {max_count}개 기준)")
+
+            # 저장된 채널 목록에 추가
+            add_saved_channel(handle, channel_title)
+
+            # 필터링 (진단 로그 포함)
+            filtered = []
+            for v in videos:
+                vid = v.get("id")
+                title = (v.get("title") or "")[:40]
+                ls = v.get("live_status")
+                dur = v.get("duration")
+                url = v.get("url") or ""
+
+                # 모든 영상의 메타데이터를 로그로 출력
+                _log(job, f"  [검사] {vid} ls={ls} dur={dur} url={url[:60]} title={title}")
+
+                # 1. 예정/진행중 라이브 제외
+                if is_excluded_live(v):
+                    _log(job, f"    → 제외: 예정/진행중 라이브 (ls={ls})", level="warn")
+                    continue
+
+                # 2. 쇼츠 제외
+                if exclude_shorts and is_shorts(v):
+                    _log(job, f"    → 제외: 쇼츠 판정 (url={url[:40]}, dur={dur})", level="warn")
+                    continue
+
+                live = is_live_video(v)
+
+                # 3. 기간 필터를 위한 upload_date 보강
+                if (date_start or date_end) and not v.get("upload_date"):
+                    try:
+                        full = fetch_video_full_meta(v["id"])
+                        v["upload_date"] = full.get("upload_date")
+                        if v.get("duration") is None:
+                            v["duration"] = full.get("duration")
+                        time.sleep(0.2)
+                    except Exception as e:
+                        _log(job, f"    → 메타 보강 실패: {e}", level="warn")
+
+                # 4. 기간 필터
+                if not in_date_range(v.get("upload_date"), date_start, date_end):
+                    _log(job, f"    → 제외: 기간 밖 (upload={v.get('upload_date')})", level="warn")
+                    continue
+
+                # 5. 길이 필터 (라이브 면제)
+                if not live:
+                    if not in_duration_range(v.get("duration"), min_sec, max_sec):
+                        _log(job, f"    → 제외: 길이 필터 (dur={dur}, min={min_sec}, max={max_sec})", level="warn")
+                        continue
+                else:
+                    _log(job, f"    → 라이브 면제 (길이 필터 건너뜀)")
+
+                _log(job, f"    → 통과")
+                filtered.append(v)
+
+
+            _log(job, f"[{handle}] 필터 통과: {len(filtered)}개")
+            channel_data.append((handle, channel_title, filtered))
+        except Exception as e:
+            _log(job, f"[{handle}] 채널 조회 실패: {e}", level="error")
+
+    # 전체 처리 대상 카운트
+    total = sum(len(v) for _, _, v in channel_data)
+    if total == 0:
+        _log(job, "처리할 영상이 없습니다.", level="error")
+        job.mark_done(None, None)
+        return
+
+    job.push({"type": "phase", "phase": "downloading",
+              "total": total, "message": "자막 다운로드 시작"})
+
+    # 2) ZIP 만들면서 영상별 자막 처리
+    done_count = 0
+    total_zip_size = 0
+    stop_due_to_size = False
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for handle, channel_title, videos in channel_data:
+            if stop_due_to_size:
+                break
+            folder = sanitize_channel_folder(channel_title)
+            consecutive_fails = 0
+
+            for v in videos:
+                if stop_due_to_size:
+                    break
+
+                done_count += 1
+                vid = v["id"]
+                title = v.get("title") or vid
+
+                job.push({
+                    "type": "progress",
+                    "current": done_count,
+                    "total": total,
+                    "channel": channel_title,
+                    "title": title,
+                    "video_id": vid,
+                })
+
+                # 캐시 체크
+                if use_cache and vid in cache:
+                    _log(job, f"  스킵(이미 받음): {title}")
+                    failed_rows.append({
+                        "channel": channel_title, "video_id": vid,
+                        "title": title, "reason": "cached_skip",
+                    })
+                    continue
+
+                # 자막 받기 (재시도 포함)
+                result = None
+                last_err = None
+                for attempt, delay in enumerate([0] + RETRY_DELAYS):
+                    if delay > 0:
+                        time.sleep(delay)
+                    try:
+                        result = fetch_transcript(vid, session=session)
+                        break
+                    except ValueError as e:
+                        last_err = str(e)
+                        # "자막이 없음" 류는 재시도 의미 없음 → 즉시 중단
+                        if ("자막" in last_err and
+                                ("없" in last_err or "비활성" in last_err)):
+                            break
+                    except Exception as e:
+                        last_err = str(e)
+
+                if result is None:
+                    consecutive_fails += 1
+                    _log(job, f"  실패: {title} ({last_err})", level="warn")
+                    failed_rows.append({
+                        "channel": channel_title, "video_id": vid,
+                        "title": title, "reason": last_err or "unknown",
+                    })
+                    if consecutive_fails >= CHANNEL_FAIL_THRESHOLD:
+                        _log(job,
+                             f"[{handle}] 연속 {CHANNEL_FAIL_THRESHOLD}회 실패 — 채널 중단",
+                             level="error")
+                        break
+                    time.sleep(REQUEST_SLEEP)
+                    continue
+
+                consecutive_fails = 0
+
+                # 파일명 생성 (업로드 날짜 필요)
+                upload_date = v.get("upload_date")
+                if not upload_date:
+                    # flat에서 누락된 경우 단건 조회
+                    try:
+                        full = fetch_video_full_meta(vid)
+                        upload_date = full.get("upload_date")
+                    except Exception:
+                        upload_date = None
+
+                fname = build_channel_filename(title, upload_date)
+                arcname = f"{folder}/{fname}"
+
+                # 본문 + BOM
+                body = "\ufeff" + result["full_text"]
+                data_bytes = body.encode("utf-8")
+
+                # 용량 상한 체크
+                if total_zip_size + len(data_bytes) > MAX_ZIP_SIZE:
+                    _log(job,
+                         f"용량 상한({MAX_ZIP_SIZE // (1024*1024)}MB) 도달 — 중단",
+                         level="error")
+                    stop_due_to_size = True
+                    break
+
+                zf.writestr(arcname, data_bytes)
+                total_zip_size += len(data_bytes)
+
+                # 캐시 등록
+                cache.add(vid)
+
+                # 인덱스 기록
+                index_rows.append({
+                    "channel": channel_title,
+                    "video_id": vid,
+                    "title": title,
+                    "upload_date": upload_date or "",
+                    "duration_sec": v.get("duration") or "",
+                    "kind": result["kind"],
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "filename": arcname,
+                })
+
+                _log(job, f"  완료: {arcname} ({result['kind']})")
+                time.sleep(REQUEST_SLEEP)
+
+        # _index.csv 작성
+        if index_rows:
+            buf = io.StringIO()
+            buf.write("\ufeff")  # 엑셀 한글 호환용 BOM
+            writer = csv.DictWriter(
+                buf,
+                fieldnames=["channel", "video_id", "title", "upload_date",
+                            "duration_sec", "kind", "url", "filename"],
+            )
+            writer.writeheader()
+            for row in index_rows:
+                writer.writerow(row)
+            zf.writestr("_index.csv", buf.getvalue().encode("utf-8"))
+
+        # _failed.txt
+        if failed_rows:
+            lines = ["실패/스킵된 영상 목록", "=" * 40, ""]
+            for r in failed_rows:
+                lines.append(
+                    f"[{r['channel']}] {r['title']}\n"
+                    f"  ID: {r['video_id']}\n"
+                    f"  사유: {r['reason']}\n"
+                )
+            zf.writestr("_failed.txt", "\n".join(lines).encode("utf-8"))
+
+    # 캐시 저장
+    if use_cache:
+        save_cache(cache)
+
+    _log(job, f"완료: {zip_filename} (성공 {len(index_rows)}개, 실패/스킵 {len(failed_rows)}개)")
+    job.mark_done(zip_path, zip_filename)

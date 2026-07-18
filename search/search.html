@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>YouTube 다중 채널 키워드 검색</title>
+<style>
+  body { font-family: "맑은 고딕", "Apple SD Gothic Neo", sans-serif;
+         max-width: 860px; margin: 30px auto; padding: 0 20px; color:#222; }
+  h1 { font-size: 1.3em; }
+  .panel { background:#f6f6f6; border:1px solid #ddd; border-radius:6px;
+           padding:12px 16px; margin-bottom:14px; font-size:0.92em; }
+  label { display:block; margin-top:10px; font-weight:bold; }
+  input[type=text], textarea {
+    width:100%; padding:8px; font-size:1em; box-sizing:border-box;
+    font-family:inherit;
+  }
+  textarea { height:100px; }
+  button { margin-top:12px; padding:9px 20px; font-size:1em; cursor:pointer;
+           background:#c00; color:white; border:none; border-radius:4px; }
+  button:hover { background:#a00; }
+  #results { margin-top:20px; font-family: Consolas, monospace; line-height:1.7; }
+  .row { padding:5px 0; border-bottom:1px dashed #ddd; }
+  .row a { color:#c00; text-decoration:none; }
+  .row a:hover { text-decoration:underline; }
+  .hint { color:#666; font-size:0.85em; margin:6px 0; }
+  .err { color:#c00; }
+  .ok  { color:#080; }
+  details { margin-top:12px; }
+  summary { cursor:pointer; color:#06c; }
+</style>
+</head>
+<body>
+  <h1>📺 YouTube 다중 채널 키워드 검색</h1>
+
+  <div class="panel" id="loadStatus">파일 로드 중…</div>
+
+  <details>
+    <summary>설정 수동 입력/수정 (자동 로드 실패 시 사용)</summary>
+    <label>API Key</label>
+    <input type="text" id="apiKey" placeholder="secret.json의 youtube_api_key 값" />
+    <label>채널 목록 (한 줄에 하나)</label>
+    <textarea id="channels" placeholder="@maebulshow"></textarea>
+  </details>
+
+  <label>키워드</label>
+  <input type="text" id="keyword" placeholder="예: 장동혁" />
+
+  <button onclick="doSearch()">검색</button>
+
+  <div id="results"></div>
+
+<script>
+const API = "https://www.googleapis.com/youtube/v3";
+const elStatus   = document.getElementById("loadStatus");
+const elApiKey   = document.getElementById("apiKey");
+const elChannels = document.getElementById("channels");
+const elKeyword  = document.getElementById("keyword");
+const elResults  = document.getElementById("results");
+
+// ─────────────────────────────────────────────
+// 1. secret.json / channels.txt 자동 로드
+// ─────────────────────────────────────────────
+async function loadConfig() {
+  const msgs = [];
+  try {
+    const r = await fetch("secret.json");
+    if (!r.ok) throw new Error(r.status);
+    const j = await r.json();
+    if (!j.youtube_api_key || j.youtube_api_key.startsWith("여기에")) {
+      msgs.push('<span class="err">⚠ secret.json에 API Key를 입력하세요.</span>');
+    } else {
+      elApiKey.value = j.youtube_api_key;
+      msgs.push('<span class="ok">✓ secret.json 로드 완료</span>');
+    }
+  } catch (e) {
+    msgs.push('<span class="err">✗ secret.json 로드 실패 ('+e.message+') — 아래 "설정 수동 입력"을 펼쳐 직접 입력하세요.</span>');
+  }
+
+  try {
+    const r = await fetch("channels.txt");
+    if (!r.ok) throw new Error(r.status);
+    const txt = await r.text();
+    elChannels.value = txt.trim();
+    const n = txt.trim().split("\n").filter(Boolean).length;
+    msgs.push('<span class="ok">✓ channels.txt 로드 완료 ('+n+'개)</span>');
+  } catch (e) {
+    msgs.push('<span class="err">✗ channels.txt 로드 실패 ('+e.message+')</span>');
+  }
+  elStatus.innerHTML = msgs.join("<br>");
+}
+
+// ─────────────────────────────────────────────
+// 2. @핸들 → channelId 변환
+// ─────────────────────────────────────────────
+async function resolveChannelId(handleOrId, key) {
+  if (/^UC[A-Za-z0-9_-]{22}$/.test(handleOrId)) return handleOrId;
+  const handle = handleOrId.replace(/^@/, "");
+  const url = `${API}/channels?part=id&forHandle=@${encodeURIComponent(handle)}&key=${key}`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  return j.items?.[0]?.id || null;
+}
+
+// ─────────────────────────────────────────────
+// 3. 채널 내 키워드 검색
+// ─────────────────────────────────────────────
+async function searchChannel(channelId, keyword, key, maxResults = 5) {
+  const url = `${API}/search?part=snippet&channelId=${channelId}`
+            + `&q=${encodeURIComponent(keyword)}&type=video`
+            + `&maxResults=${maxResults}&order=date&key=${key}`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  return j.items || [];
+}
+
+// ─────────────────────────────────────────────
+// 4. HTML 엔티티 디코딩
+// ─────────────────────────────────────────────
+function decode(s) {
+  return s.replace(/&amp;/g,"&").replace(/&quot;/g,'"')
+          .replace(/&#39;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">");
+}
+
+// ─────────────────────────────────────────────
+// 5. 검색 메인
+// ─────────────────────────────────────────────
+async function doSearch() {
+  const key = elApiKey.value.trim();
+  const keyword = elKeyword.value.trim();
+  const channels = elChannels.value.split("\n").map(s=>s.trim()).filter(Boolean);
+
+  if (!key)      { elResults.innerHTML = '<p class="err">API Key가 없습니다.</p>'; return; }
+  if (!keyword)  { elResults.innerHTML = '<p class="err">키워드를 입력하세요.</p>'; return; }
+  if (!channels.length) { elResults.innerHTML = '<p class="err">채널이 없습니다.</p>'; return; }
+
+  elResults.innerHTML = "<p>검색 중…</p>";
+  const rows = [];
+  let idx = 1;
+
+  for (const ch of channels) {
+    try {
+      const id = await resolveChannelId(ch, key);
+      if (!id) { rows.push(`<div class="row err">${ch} → 채널을 찾을 수 없음</div>`); continue; }
+      const vids = await searchChannel(id, keyword, key);
+      if (!vids.length) { rows.push(`<div class="row">${ch} → 검색 결과 없음</div>`); continue; }
+      for (const v of vids) {
+        const title = decode(v.snippet.title);
+        const vid = v.id.videoId;
+        const date = v.snippet.publishedAt.slice(0,10);
+        rows.push(
+          `<div class="row">#${idx} ${ch}, `
+          + `<a href="https://www.youtube.com/watch?v=${vid}" target="_blank">${title}</a>, `
+          + `${keyword} <span class="hint">(${date})</span></div>`
+        );
+        idx++;
+      }
+    } catch (e) {
+      rows.push(`<div class="row err">${ch} → 오류: ${e.message}</div>`);
+    }
+  }
+  elResults.innerHTML = rows.join("") || "<p>결과 없음</p>";
+}
+
+elKeyword.addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+
+// 초기화
+loadConfig();
+</script>
+</body>
+</html>
