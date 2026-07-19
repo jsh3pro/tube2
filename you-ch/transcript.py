@@ -156,16 +156,20 @@ def _build_session_with_cookies(verbose: bool = True):
     return session
 
 
-def fetch_transcript(video_id: str, session=None) -> dict:
+def fetch_transcript(video_id: str, session=None,
+                     translate_to_ko: bool = True) -> dict:
     """자막을 가져와 가공된 결과 반환.
 
-    우선순위: 한국어 수동 → 한국어 자동.
+    우선순위:
+      1) 한국어 수동
+      2) 한국어 자동
+      3) 한국어로 번역 가능한 자막(원어→ko 번역)
+      4) 원어 자막 그대로(수동 우선, 없으면 자동)
 
     Args:
         video_id: 유튜브 영상 ID.
         session: 외부에서 주입할 requests.Session (선택).
-                 None이면 내부에서 새로 생성 (기존 단건 동작).
-                 채널 모드에서는 세션 1개를 재사용하여 호출.
+        translate_to_ko: True면 한국어 자막이 없을 때 번역을 시도.
     """
     if session is None:
         session = _build_session_with_cookies()
@@ -181,16 +185,18 @@ def fetch_transcript(video_id: str, session=None) -> dict:
     except Exception as e:
         raise ValueError(f"자막 목록을 가져오는 중 오류가 발생했습니다: {e}")
 
-    # 한국어 수동 자막 우선 시도
     chosen = None
-    kind = None
+    kind = None          # "manual" | "auto" | "translated" | "original"
+    language = "ko"
+
+    # 1) 한국어 수동
     try:
         chosen = transcript_list.find_manually_created_transcript(["ko"])
         kind = "manual"
     except NoTranscriptFound:
         pass
 
-    # 없으면 한국어 자동 자막
+    # 2) 한국어 자동
     if chosen is None:
         try:
             chosen = transcript_list.find_generated_transcript(["ko"])
@@ -198,8 +204,51 @@ def fetch_transcript(video_id: str, session=None) -> dict:
         except NoTranscriptFound:
             pass
 
+    # 3) 한국어로 번역 가능한 자막 찾기
+    if chosen is None and translate_to_ko:
+        translatable = None
+        # 번역 가능한 자막 중 아무거나 (수동 자막을 우선 선호)
+        for t in transcript_list:
+            if not t.is_translatable:
+                continue
+            if not any(l.language_code == "ko"
+                       for l in t.translation_languages):
+                continue
+
+            if translatable is None:
+                translatable = t
+            # 수동 자막이면 더 선호하고 바로 채택
+            if not t.is_generated:
+                translatable = t
+                break
+        if translatable is not None:
+            try:
+                chosen = translatable.translate("ko")
+                kind = "translated"
+                language = "ko"
+            except Exception:
+                chosen = None
+
+    # 4) 원어 자막 그대로 (수동 우선, 없으면 자동)
     if chosen is None:
-        raise ValueError("이 영상에는 한국어 자막(수동/자동)이 없습니다.")
+        original = None
+        # 수동 먼저
+        for t in transcript_list:
+            if not t.is_generated:
+                original = t
+                break
+        # 없으면 자동이라도
+        if original is None:
+            for t in transcript_list:
+                original = t
+                break
+        if original is not None:
+            chosen = original
+            kind = "original"
+            language = original.language_code
+
+    if chosen is None:
+        raise ValueError("이 영상에는 사용할 수 있는 자막이 없습니다.")
 
     # 실제 자막 데이터 가져오기
     try:
@@ -211,7 +260,6 @@ def fetch_transcript(video_id: str, session=None) -> dict:
     lines = []
     prev_text = ""
     for snippet in fetched:
-        # FetchedTranscriptSnippet 객체: .text, .start, .duration
         text = snippet.text.replace("\n", " ").strip()
         if not text:
             continue
@@ -220,16 +268,17 @@ def fetch_transcript(video_id: str, session=None) -> dict:
             continue
         ts = format_timestamp(snippet.start)
         lines.append((ts, cleaned))
-        prev_text = text  # 비교는 원본 기준
+        prev_text = text
 
     full_text = "\n".join(f"{ts} {txt}" for ts, txt in lines)
 
     return {
         "kind": kind,
-        "language": "ko",
+        "language": language,
         "lines": lines,
         "full_text": full_text,
     }
+
 
 
 def make_preview(full_text: str, max_chars: int = 100) -> str:
