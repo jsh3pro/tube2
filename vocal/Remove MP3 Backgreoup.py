@@ -77,10 +77,24 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.set_status("이미 처리 중이에요. 잠시만 기다려주세요.")
             return
         files = self.tk.splitlist(event.data)
-        audio = [f for f in files if f.lower().endswith(SUPPORTED)]
-        if not audio:
-            self.set_status("지원하지 않는 형식이에요. (mp3, wav, flac, m4a, ogg)")
+        if not files:
+            self.set_status("파일을 인식하지 못했어요. 다시 시도해주세요.")
             return
+
+        first = files[0]
+        ext = os.path.splitext(first)[1].lower()
+        audio = [f for f in files if f.lower().endswith(SUPPORTED)]
+
+        if not audio:
+            # 어떤 파일/확장자인지 그대로 보여줘서 원인을 알 수 있게 함
+            self.set_status(
+                f"지원하지 않는 형식이에요.\n"
+                f"드롭한 파일: {os.path.basename(first)}\n"
+                f"인식된 확장자: '{ext or '(없음)'}'\n"
+                f"지원 형식: mp3, wav, flac, m4a, ogg"
+            )
+            return
+
         threading.Thread(target=self.separate, args=(audio[0],), daemon=True).start()
 
     # ---------- 분리 실행 ----------
@@ -116,12 +130,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 creationflags=creationflags)
 
             pct_re = re.compile(r"(\d{1,3})%")
-            last_lines = []            # 에러 진단용으로 마지막 출력 저장
+            last_lines = []
             for line in proc.stdout:
                 line = line.strip()
                 if line:
                     last_lines.append(line)
-                    last_lines = last_lines[-8:]     # 최근 8줄만 유지
+                    last_lines = last_lines[-8:]
                 m = pct_re.search(line)
                 if m:
                     p = int(m.group(1)) / 100
@@ -152,7 +166,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         finally:
             self.is_processing = False
 
-    # ---------- 유틸 (스레드 → UI 안전 업데이트) ----------
+    # ---------- 유틸 ----------
     def set_status(self, text):
         self.after(0, lambda: self.status_label.configure(text=text))
 
@@ -162,7 +176,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def open_output(self):
         target = self.last_output or OUTPUT_DIR
         if os.path.isdir(target):
-            os.startfile(target)   # Windows 전용
+            os.startfile(target)
 
     def reset(self):
         if self.is_processing:
