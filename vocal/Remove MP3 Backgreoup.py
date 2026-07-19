@@ -16,28 +16,22 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
-# CustomTkinter + 드래그앤드롭을 합치기 위한 클래스
 class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
         self.TkdndVersion = TkinterDnD._require(self)
 
         self.title("보컬 추출기  ·  htdemucs_ft")
-        self.geometry("520x420")
-        self.minsize(460, 380)
+        self.geometry("520x440")
+        self.minsize(460, 400)
         self.is_processing = False
         self.last_output = None
 
         # ---- 제목 ----
-        self.title_label = ctk.CTkLabel(
-            self, text="🎤  보컬만 추출하기",
-            font=ctk.CTkFont(size=24, weight="bold"))
-        self.title_label.pack(pady=(24, 4))
-
-        self.sub_label = ctk.CTkLabel(
-            self, text="목소리만 남기고 배경음악을 제거합니다",
-            font=ctk.CTkFont(size=13), text_color="gray70")
-        self.sub_label.pack(pady=(0, 16))
+        ctk.CTkLabel(self, text="🎤  보컬만 추출하기",
+                     font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(24, 4))
+        ctk.CTkLabel(self, text="목소리만 남기고 배경음악을 제거합니다",
+                     font=ctk.CTkFont(size=13), text_color="gray70").pack(pady=(0, 16))
 
         # ---- 드롭 영역 ----
         self.drop_frame = ctk.CTkFrame(
@@ -45,7 +39,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             border_width=2, border_color="gray40", fg_color="gray17")
         self.drop_frame.pack(fill="x", padx=30, pady=6)
         self.drop_frame.pack_propagate(False)
-
         self.drop_label = ctk.CTkLabel(
             self.drop_frame,
             text="⬇  여기에 오디오 파일을 드롭하세요\n\n(mp3, wav, flac, m4a, ogg)",
@@ -59,22 +52,19 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.status_label = ctk.CTkLabel(
             self, text="대기 중 — 파일을 드롭하면 시작합니다.",
-            font=ctk.CTkFont(size=13), wraplength=440)
+            font=ctk.CTkFont(size=13), wraplength=440, justify="center")
         self.status_label.pack(pady=(2, 8))
 
         # ---- 버튼 ----
-        self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.btn_frame.pack(pady=(4, 14))
-
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(4, 14))
         self.open_btn = ctk.CTkButton(
-            self.btn_frame, text="📂 결과 폴더 열기",
+            btn_frame, text="📂 결과 폴더 열기",
             command=self.open_output, state="disabled", width=160)
         self.open_btn.grid(row=0, column=0, padx=6)
-
         self.reset_btn = ctk.CTkButton(
-            self.btn_frame, text="🔄 다시 하기",
-            command=self.reset, fg_color="gray30",
-            hover_color="gray25", width=120)
+            btn_frame, text="🔄 다시 하기", command=self.reset,
+            fg_color="gray30", hover_color="gray25", width=120)
         self.reset_btn.grid(row=0, column=1, padx=6)
 
         # ---- 드래그앤드롭 등록 ----
@@ -91,7 +81,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if not audio:
             self.set_status("지원하지 않는 형식이에요. (mp3, wav, flac, m4a, ogg)")
             return
-        # 첫 번째 파일만 처리
         threading.Thread(target=self.separate, args=(audio[0],), daemon=True).start()
 
     # ---------- 분리 실행 ----------
@@ -101,7 +90,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.after(0, lambda: self.open_btn.configure(state="disabled"))
         self.set_progress(0.02)
         name = os.path.basename(file_path)
-        self.set_status(f"모델 준비 중...  ({name})")
+        self.set_status(f"모델 준비 중...  ({name})\n첫 실행 시 모델 다운로드로 시간이 걸릴 수 있어요.")
 
         try:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -114,7 +103,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 file_path,
             ]
 
-            # Windows: 콘솔창 숨김
             creationflags = 0
             startupinfo = None
             if os.name == "nt":
@@ -127,9 +115,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 text=True, bufsize=1, startupinfo=startupinfo,
                 creationflags=creationflags)
 
-            # demucs는 진행률을 stderr에 "  53%|####" 형태로 출력함
             pct_re = re.compile(r"(\d{1,3})%")
+            last_lines = []            # 에러 진단용으로 마지막 출력 저장
             for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    last_lines.append(line)
+                    last_lines = last_lines[-8:]     # 최근 8줄만 유지
                 m = pct_re.search(line)
                 if m:
                     p = int(m.group(1)) / 100
@@ -139,7 +131,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             proc.wait()
 
             if proc.returncode != 0:
-                self.set_status("오류가 발생했어요. FFmpeg 설치 여부를 확인해보세요.")
+                msg = "\n".join(last_lines) or "알 수 없는 오류"
+                self.set_status("❌ demucs 실행 실패:\n" + msg[-400:])
                 self.set_progress(0)
                 return
 
@@ -151,10 +144,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.after(0, lambda: self.open_btn.configure(state="normal"))
 
         except FileNotFoundError:
-            self.set_status("demucs를 찾을 수 없어요. 'pip install demucs'를 확인하세요.")
+            self.set_status("❌ demucs를 찾을 수 없어요.\n'pip install demucs' 설치를 확인하세요.")
             self.set_progress(0)
         except Exception as e:
-            self.set_status(f"오류: {e}")
+            self.set_status(f"❌ 오류: {e}")
             self.set_progress(0)
         finally:
             self.is_processing = False
@@ -181,5 +174,4 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()
