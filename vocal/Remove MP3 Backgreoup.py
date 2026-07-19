@@ -9,6 +9,8 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 # ------------------- 설정 -------------------
 MODEL = "htdemucs_ft"   # 보컬 품질이 가장 좋은 fine-tuned 모델
+# 속도가 더 중요하면 "htdemucs" 로 바꾸세요 (약 4배 빠름, 품질 손실 미미)
+
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "Vocals_Output")
 SUPPORTED = (".mp3", ".wav", ".flac", ".m4a", ".ogg")
 
@@ -16,14 +18,28 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
+def detect_device():
+    """torch가 GPU(CUDA)를 쓸 수 있으면 'cuda', 아니면 'cpu' 반환."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda", torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return "cpu", None
+
+
 class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
         self.TkdndVersion = TkinterDnD._require(self)
 
-        self.title("보컬 추출기  ·  htdemucs_ft")
-        self.geometry("520x440")
-        self.minsize(460, 400)
+        # 실행 시점에 GPU 사용 가능 여부 판별
+        self.device, self.gpu_name = detect_device()
+
+        self.title("보컬 추출기  ·  " + MODEL)
+        self.geometry("520x470")
+        self.minsize(460, 430)
         self.is_processing = False
         self.last_output = None
 
@@ -31,7 +47,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ctk.CTkLabel(self, text="🎤  보컬만 추출하기",
                      font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(24, 4))
         ctk.CTkLabel(self, text="목소리만 남기고 배경음악을 제거합니다",
-                     font=ctk.CTkFont(size=13), text_color="gray70").pack(pady=(0, 16))
+                     font=ctk.CTkFont(size=13), text_color="gray70").pack(pady=(0, 6))
+
+        # ---- 장치 표시 ----
+        if self.device == "cuda":
+            dev_text = f"⚡ GPU 가속 사용 중  ·  {self.gpu_name}"
+            dev_color = "#4ade80"
+        else:
+            dev_text = "🐢 CPU 모드 (느림) — GPU 버전 torch 설치를 권장합니다"
+            dev_color = "#fbbf24"
+        ctk.CTkLabel(self, text=dev_text,
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color=dev_color).pack(pady=(0, 14))
 
         # ---- 드롭 영역 ----
         self.drop_frame = ctk.CTkFrame(
@@ -86,7 +113,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         audio = [f for f in files if f.lower().endswith(SUPPORTED)]
 
         if not audio:
-            # 어떤 파일/확장자인지 그대로 보여줘서 원인을 알 수 있게 함
             self.set_status(
                 f"지원하지 않는 형식이에요.\n"
                 f"드롭한 파일: {os.path.basename(first)}\n"
@@ -98,24 +124,33 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         threading.Thread(target=self.separate, args=(audio[0],), daemon=True).start()
 
     # ---------- 분리 실행 ----------
-    def separate(self, file_path):
+    def separate(self, file_path, segment=None):
         self.is_processing = True
         self.last_output = None
         self.after(0, lambda: self.open_btn.configure(state="disabled"))
         self.set_progress(0.02)
         name = os.path.basename(file_path)
-        self.set_status(f"모델 준비 중...  ({name})\n첫 실행 시 모델 다운로드로 시간이 걸릴 수 있어요.")
+
+        dev_msg = "GPU" if self.device == "cuda" else "CPU"
+        self.set_status(
+            f"모델 준비 중... ({dev_msg} 모드)  ({name})\n"
+            f"첫 실행 시 모델 다운로드로 시간이 걸릴 수 있어요."
+        )
 
         try:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
             cmd = [
                 sys.executable, "-m", "demucs",
                 "-n", MODEL,
+                "-d", self.device,          # cuda(GPU) 또는 cpu 자동 선택
                 "--two-stems", "vocals",
                 "--mp3",
                 "-o", OUTPUT_DIR,
-                file_path,
             ]
+            # VRAM 부족(OOM) 재시도 시 세그먼트 분할 적용
+            if segment is not None:
+                cmd += ["--segment", str(segment)]
+            cmd.append(file_path)
 
             creationflags = 0
             startupinfo = None
@@ -140,12 +175,23 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 if m:
                     p = int(m.group(1)) / 100
                     self.set_progress(max(0.02, p))
-                    self.set_status(f"분리 중...  {int(p*100)}%   ({name})")
+                    self.set_status(f"분리 중... ({dev_msg})  {int(p*100)}%   ({name})")
 
             proc.wait()
 
             if proc.returncode != 0:
-                msg = "\n".join(last_lines) or "알 수 없는 오류"
+                full_log = "\n".join(last_lines)
+
+                # GPU 메모리 부족(OOM) 감지 → 세그먼트 줄여서 자동 재시도
+                oom = ("out of memory" in full_log.lower()
+                       or "cuda error" in full_log.lower())
+                if oom and self.device == "cuda" and segment is None:
+                    self.set_status("⚠ GPU 메모리 부족 — 조각 분할 모드로 다시 시도합니다...")
+                    self.is_processing = False
+                    self.separate(file_path, segment=7)   # 재시도
+                    return
+
+                msg = full_log or "알 수 없는 오류"
                 self.set_status("❌ demucs 실행 실패:\n" + msg[-400:])
                 self.set_progress(0)
                 return
